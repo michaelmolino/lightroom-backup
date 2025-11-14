@@ -1,0 +1,4 @@
+.DS_STORE
+src/.authentication
+src/*.pem
+src/*.json
