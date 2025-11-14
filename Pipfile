@@ -5,7 +5,6 @@ verify_ssl = true
 
 [packages]
 requests = "*"
-tqdm = "*"
 
 [requires]
 python_version = "3"

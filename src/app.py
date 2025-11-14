@@ -4,14 +4,15 @@ import ssl
 import os
 from urllib.parse import urlencode
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime
 
 CLIENT_ID = os.environ.get("LIGHTROOM_CLIENT_ID") or None
 CLIENT_SECRET = os.environ.get("LIGHTROOM_CLIENT_SECRET") or None
 
-REDIRECT_URI = "https://localhost:8080/callback"
-OUTPUT_FILE = "lightroom_backup.json"
-AUTH_CACHE_FILE = ".authentication"
+OUTPUT_FILE = f"./backups/lightroom_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+AUTH_CACHE_FILE = ".lightroom-backup-authentication.json"
 
+REDIRECT_URI = "https://localhost:8080/callback"
 AUTH_URL = "https://ims-na1.adobelogin.com/ims/authorize"
 TOKEN_URL = "https://ims-na1.adobelogin.com/ims/token"
 API_BASE = "https://lr.adobe.io/v2"
@@ -45,7 +46,6 @@ def get_authorization_code():
         "redirect_uri": REDIRECT_URI
     }
     url = f"{AUTH_URL}?{urlencode(params)}"
-    print(f"Open this URL in your browser and log in:\n\n{url}\n")
 
     # Container to store the auth code
     auth_code_container: dict[str, str | None] = {"code": None}
@@ -68,22 +68,36 @@ def get_authorization_code():
                 self.wfile.write(b"<html><body><h2>Error: No code found.</h2></body></html>")
 
     # Create SSL context with self-signed certificate
-    cert_file = "cert.pem"
-    key_file = "key.pem"
+    cert_file = "./certs/cert.pem"
+    key_file = "./certs/key.pem"
     
     # Generate self-signed certificate if it doesn't exist
     if not os.path.exists(cert_file) or not os.path.exists(key_file):
         print("Generating self-signed SSL certificate...")
         import subprocess
-        subprocess.run([
-            "openssl", "req", "-x509", "-newkey", "rsa:4096",
-            "-keyout", key_file, "-out", cert_file,
-            "-days", "365", "-nodes",
-            "-subj", "/CN=localhost"
-        ], check=True, capture_output=True)
+        san = "DNS:localhost,DNS:host.docker.internal,IP:127.0.0.1"
+        try:
+            # Try modern OpenSSL with -addext
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:4096",
+                "-keyout", key_file, "-out", cert_file,
+                "-days", "365", "-nodes",
+                "-subj", "/CN=localhost",
+                "-addext", f"subjectAltName={san}"
+            ], check=True, capture_output=True)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            # Fallback: generate without SAN (browser will warn, but it works)
+            subprocess.run([
+                "openssl", "req", "-x509", "-newkey", "rsa:4096",
+                "-keyout", key_file, "-out", cert_file,
+                "-days", "365", "-nodes",
+                "-subj", "/CN=localhost"
+            ], check=True, capture_output=True)
         print("Certificate generated.\n")
     
-    server = HTTPServer(("localhost", 8080), Handler)
+    print(f"Open this URL in your browser and log in:\n\n{url}\n")
+ 
+    server = HTTPServer(("0.0.0.0", 8080), Handler)
     
     # Wrap socket with SSL
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
