@@ -2,3 +2,4 @@
 .lightroom-backup-authentication.json
 *.pem
 *.json
+*.bak
