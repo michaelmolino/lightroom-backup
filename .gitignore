@@ -2,3 +2,8 @@
 .lightroom-backup-authentication.json
 *.pem
 *.json
+*.bak
+*.log
+__pycache__/
+*.pyc
+backups/
