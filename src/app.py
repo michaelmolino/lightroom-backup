@@ -1,23 +1,106 @@
+import os
 import json
 import requests
 import ssl
-import os
+import hashlib
+import exifread
+from datetime import datetime
 from urllib.parse import urlencode
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from datetime import datetime
+import argparse
+import logging
+import re
 
-CLIENT_ID = os.environ.get("LIGHTROOM_CLIENT_ID") or None
-CLIENT_SECRET = os.environ.get("LIGHTROOM_CLIENT_SECRET") or None
-
-OUTPUT_FILE = f"./backups/lightroom_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-AUTH_CACHE_FILE = ".lightroom-backup-authentication.json"
-
+# Config 
+API_BASE = "https://lr.adobe.io/v2"
 REDIRECT_URI = "https://localhost:8080/callback"
 AUTH_URL = "https://ims-na1.adobelogin.com/ims/authorize"
 TOKEN_URL = "https://ims-na1.adobelogin.com/ims/token"
-API_BASE = "https://lr.adobe.io/v2"
-
+CLIENT_ID = os.environ.get("LIGHTROOM_CLIENT_ID") or None
+CLIENT_SECRET = os.environ.get("LIGHTROOM_CLIENT_SECRET") or None
+AUTH_CACHE_FILE = ".lightroom-backup-authentication.json"
 PAGE_SIZE = 200
+
+OUTPUT_FILE = f"./backups/lightroom_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+ORIGINALS_DIR = os.environ.get("LIGHTROOM_ORIGINALS_DIR") or "/data/originals"
+EXPORTS_DIR = os.environ.get("LIGHTROOM_EXPORTS_DIR") or "/data/exports"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s',
+    handlers=[
+        logging.FileHandler("app.log", mode="a", encoding="utf-8"),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger("lightroom-app")
+
+# Helpers
+def normalize(rel):
+    return rel.strip("/").replace("\\", "/").lower()
+
+def sha256_of_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def scan_local_files(base_dir):
+    rel_paths = set()
+    base_len = len(base_dir.rstrip("/")) + 1
+    for root, _, files in os.walk(base_dir):
+        for f in files:
+            if f.startswith("."):
+                continue
+            abs_path = os.path.join(root, f)
+            rel_path = abs_path[base_len:].replace("\\", "/")
+            rel_paths.add(rel_path)
+    return rel_paths
+
+def get_capture_date_from_exif(path):
+    with open(path, 'rb') as f:
+        tags = exifread.process_file(f, details=False)
+        candidates = []
+        # Check all tags ending with 'DateTimeOriginal' or 'Date/Time Original' (case-insensitive)
+        for key, date_tag in tags.items():
+            key_lower = key.lower()
+            if key_lower.endswith('datetimeoriginal') or key_lower.endswith('date/time original'):
+                date_str = str(date_tag)
+                # Match with optional fractional seconds
+                match = re.match(r"^(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?", date_str)
+                if match:
+                    year, month, day, hour, minute, second, frac = match.groups()
+                    iso = f"{year}-{month}-{day}T{hour}:{minute}:{second}"
+                    if frac:
+                        iso += f".{frac}"
+                    candidates.append(iso)
+        # Prefer the one with the most precision (longest string)
+        if candidates:
+            candidates.sort(key=len, reverse=True)
+            return candidates[0]
+        return None
+
+def normalize_capture_date(date_str):
+    if not date_str:
+        return None
+    date_str = date_str.strip()
+    # Remove trailing Z or timezone offset, keep fractional seconds
+    # Normalize: drop fractional seconds if all zeros (e.g., .00, .000)
+    match = re.match(r"^([\dT:\-]+:\d{2})(\.\d+)?(?:Z|[+-]\d+:?\d*)?$", date_str)
+    if match:
+        base = match.group(1)
+        frac = match.group(2)
+        if frac and re.fullmatch(r"\.0+", frac):
+            return base
+        elif frac:
+            return base + frac
+        else:
+            return base
+    match2 = re.match(r"^([0-9T:\.-]+)", date_str)
+    if match2:
+        return match2.group(1)
+    return date_str
 
 def load_cached_token():
     """Load cached OAuth token JSON from AUTH_CACHE_FILE, or return None."""
@@ -26,7 +109,6 @@ def load_cached_token():
             with open(AUTH_CACHE_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
     except Exception:
-        # Ignore cache read errors; treat as no cache
         pass
     return None
 
@@ -36,7 +118,7 @@ def save_token(token_data: dict):
         with open(AUTH_CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(token_data, f, indent=2)
     except Exception as e:
-        print(f"Warning: failed to write auth cache: {e}")
+        log.warning(f"Failed to write auth cache: {e}")
 
 def get_authorization_code():
     params = {
@@ -47,7 +129,6 @@ def get_authorization_code():
     }
     url = f"{AUTH_URL}?{urlencode(params)}"
 
-    # Container to store the auth code
     auth_code_container: dict[str, str | None] = {"code": None}
 
     class Handler(BaseHTTPRequestHandler):
@@ -67,13 +148,12 @@ def get_authorization_code():
                 self.end_headers()
                 self.wfile.write(b"<html><body><h2>Error: No code found.</h2></body></html>")
 
-    # Create SSL context with self-signed certificate
     cert_file = "./certs/cert.pem"
     key_file = "./certs/key.pem"
     
     # Generate self-signed certificate if it doesn't exist
     if not os.path.exists(cert_file) or not os.path.exists(key_file):
-        print("Generating self-signed SSL certificate...")
+        log.info("Generating self-signed SSL certificate...")
         import subprocess
         san = "DNS:localhost,DNS:host.docker.internal,IP:127.0.0.1"
         try:
@@ -93,19 +173,17 @@ def get_authorization_code():
                 "-days", "365", "-nodes",
                 "-subj", "/CN=localhost"
             ], check=True, capture_output=True)
-        print("Certificate generated.\n")
+        log.info("Certificate generated.")
     
     print(f"Open this URL in your browser and log in:\n\n{url}\n")
  
     server = HTTPServer(("0.0.0.0", 8080), Handler)
     
-    # Wrap socket with SSL
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.minimum_version = ssl.TLSVersion.TLSv1_2
     context.load_cert_chain(cert_file, key_file)
     server.socket = context.wrap_socket(server.socket, server_side=True)
     
-    # Handle multiple requests in case browser makes multiple attempts
     while auth_code_container["code"] is None:
         server.handle_request()
     
@@ -127,10 +205,9 @@ def get_json(url, headers):
     r = requests.get(url, headers=headers)
     r.raise_for_status()
     
-    # Adobe Lightroom API returns JSON with a security prefix
     text = r.text
     if text.startswith("while (1) {}"):
-        text = text[12:]  # Remove the "while (1) {}" prefix
+        text = text[12:]
     
     return json.loads(text)
 
@@ -139,7 +216,6 @@ def get_album_info(album):
     album_id = album["id"]
     payload = album.get("payload", {})
     
-    # Get album name
     name = (
         payload.get("name") or 
         payload.get("source") or 
@@ -147,7 +223,6 @@ def get_album_info(album):
         f"album_{album_id}"
     )
     
-    # Get parent album ID for hierarchy
     parent_id = payload.get("parent", {}).get("id") if "parent" in payload else None
     
     return {
@@ -169,15 +244,13 @@ def fetch_all_assets(catalog_id, album_id, headers):
         data = get_json(album_assets_url, headers)
         resources = data.get("resources", [])
         assets.extend(resources)
-        print(f"    Fetched page {page}: {len(resources)} assets (total: {len(assets)})", flush=True)
+        log.info(f"Fetched page {page}: {len(resources)} assets (total: {len(assets)})")
         page += 1
         
-        # Get the next URL correctly - it's a dict with "href" key
         next_link = data.get("links", {}).get("next", {})
         if isinstance(next_link, dict):
             href = next_link.get("href")
             if href:
-                # The href is relative and needs catalog ID prepended
                 if not href.startswith("http"):
                     album_assets_url = f"{API_BASE}/catalogs/{catalog_id}/{href}"
                 else:
@@ -228,7 +301,7 @@ def build_flags_map(catalog_id, album_id, headers):
             for rid in ids:
                 flags_map[rid] = flag_value
         except Exception as e:
-            print(f"  Warning: could not fetch flag '{flag_value}': {e}")
+            log.error(f"Could not fetch flag '{flag_value}': {e}")
     return flags_map
 
 def get_stack_child_assets(catalog_id, embedded_asset: dict, headers):
@@ -239,7 +312,6 @@ def get_stack_child_assets(catalog_id, embedded_asset: dict, headers):
     if not href:
         return []
 
-    # Build absolute URL similar to pagination logic
     if href.startswith("http"):
         url = href
     elif href.startswith("catalogs/"):
@@ -247,7 +319,6 @@ def get_stack_child_assets(catalog_id, embedded_asset: dict, headers):
     else:
         url = f"{API_BASE}/catalogs/{catalog_id}/{href}"
 
-    # Ensure we embed asset payloads to extract importSource
     if "embed=" not in url:
         sep = '&' if '?' in url else '?'
         url = f"{url}{sep}embed=asset"
@@ -319,16 +390,14 @@ def record_asset_in_backup(res, album_path, flags_map, backup_data):
         metadata.get("fileName") is None
         and metadata.get("sha256") is None
     ):
-        print(f"    Skipping asset {underlying_id} with no filename or sha256.")
-        return  # Nothing meaningful to record
+        log.info(f"Skipping asset {underlying_id} with no filename or sha256.")
+        return
     resolved_flag = flags_map.get(underlying_id)
     metadata["flag"] = resolved_flag
     
-    # Track in album
     if underlying_id not in backup_data["albums"][album_path]["asset_ids"]:
         backup_data["albums"][album_path]["asset_ids"].append(underlying_id)
     
-    # Merge album paths if asset already exists
     existing_albums = backup_data["photos"].get(underlying_id, {}).get("albumPaths", [])
     if album_path not in existing_albums:
         existing_albums = existing_albums + [album_path]
@@ -341,9 +410,9 @@ def record_asset_in_backup(res, album_path, flags_map, backup_data):
 def process_album_assets(catalog_id, album_id, album_path, headers, backup_data):
     """Process all assets for a single album."""
     flags_map = build_flags_map(catalog_id, album_id, headers)
-    print(f"  Found {len(flags_map)} assets...")
+    log.info(f"Found {len(flags_map)} assets...")
 
-    print("  Fetching assets...")
+    log.info("Fetching assets...")
     assets = fetch_all_assets(catalog_id, album_id, headers)
     
     for asset in assets:
@@ -358,13 +427,13 @@ def process_albums(catalog_id, albums, headers):
     backup_data = {"albums": {}, "photos": {}}
     album_map = build_album_hierarchy(albums)
     
-    print(f"\nProcessing {len(albums)} albums...")
+    log.info(f"Processing {len(albums)} albums...")
     for idx, album in enumerate(albums, 1):
         album_id = album["id"]
         album_info = album_map[album_id]
         album_path = get_album_full_path(album_id, album_map)
         
-        print(f"[{idx}/{len(albums)}] Album: {album_path}")
+        log.info(f"[{idx}/{len(albums)}] Album: {album_path}")
         
         backup_data["albums"][album_path] = {
             "id": album_id,
@@ -376,7 +445,7 @@ def process_albums(catalog_id, albums, headers):
         }
         
         asset_count = process_album_assets(catalog_id, album_id, album_path, headers, backup_data)
-        print(f"  ✓ Completed album: {album_path} ({asset_count} assets)\n")
+        log.info(f"✓ Completed album: {album_path} ({asset_count} assets)")
     
     return backup_data
 
@@ -391,11 +460,11 @@ def get_authenticated_headers_and_catalog():
         headers = {"Authorization": f"Bearer {token_data['access_token']}", "x-api-key": CLIENT_ID}
         try:
             catalog_data = get_json(f"{API_BASE}/catalog", headers)
-            print("Using cached auth token.")
+            log.info("Using cached auth token.")
         except requests.HTTPError as e:
             status = getattr(e.response, "status_code", None)
             if status in (401, 403):
-                print("Cached token invalid or expired. Starting OAuth login...")
+                log.info("Cached token invalid or expired. Starting OAuth login...")
                 headers = None
                 catalog_data = None
             else:
@@ -414,7 +483,7 @@ def get_authenticated_headers_and_catalog():
 
 def fetch_all_albums(catalog_id, headers):
     """Fetch all albums with pagination."""
-    print("\nFetching albums...")
+    log.info("Fetching albums...")
     albums = []
     albums_url = f"{API_BASE}/catalogs/{catalog_id}/albums?limit={PAGE_SIZE}"
     page = 1
@@ -423,27 +492,155 @@ def fetch_all_albums(catalog_id, headers):
         data = get_json(albums_url, headers)
         resources = data.get("resources", [])
         albums.extend(resources)
-        print(f"  Fetched page {page}: {len(resources)} albums (total: {len(albums)})", flush=True)
+        log.info(f"Fetched page {page}: {len(resources)} albums (total: {len(albums)})")
         page += 1
         albums_url = get_next_page_url(data, catalog_id)
     
-    print(f"Found {len(albums)} total albums.")
+    log.info(f"Found {len(albums)} total albums.")
     return albums
 
-def main():
-    print("Starting Adobe Lightroom metadata backup...")
-    
-    headers, catalog_data = get_authenticated_headers_and_catalog()
-    catalog_id = catalog_data["id"]
-    print(f"Catalog ID: {catalog_id}")
+def match_files_to_assets(photos, originals_dir, exports_dir):
+    log.info("Scanning originals directory...")
+    originals = scan_local_files(originals_dir)
+    log.info(f"Found {len(originals)} original files.")
 
-    albums = fetch_all_albums(catalog_id, headers)
-    backup_data = process_albums(catalog_id, albums, headers)
+    log.info("Scanning exports/edits directory...")
+    exports = scan_local_files(exports_dir)
+    log.info(f"Found {len(exports)} export/edit files.")
+
+    # matched_rel_paths is the set of original files matched by filename/path
+    # this is the preferred way to match originals to assets
+    matched_rel_paths = _match_originals_by_filename_path(photos, originals)
+    unmatched_files = originals - matched_rel_paths
+    log.info(f"Unmatched files which will fall back to SHA256 matching: {len(unmatched_files)}")
+
+    # Now try to match unmatched originals by SHA256
+    # Only has local files that were not matched by filename/path
+    _match_originals_by_sha256(photos, unmatched_files, originals_dir)
+    _log_missing_local_originals(photos)
+
+    # Now match exports/edits by EXIF capture date
+    # Since these files are edited and renamed, we can't fall back to filename/path or SHA256
+    # We can only rely on exact time date matches
+    # date_to_asset_ids matches the capture date to an array of unique asset IDs
+    date_to_asset_ids = {}
+    for asset_id, info in photos.items():
+        norm_date = normalize_capture_date(info.get("captureDate"))
+        if norm_date:
+            date_to_asset_ids.setdefault(norm_date, []).append(asset_id)
+    _match_exports_by_exif_date(photos, exports, date_to_asset_ids, exports_dir)
+
+def _match_originals_by_filename_path(photos, originals):
+    matched_rel_paths = set()
+    for asset_id, info in photos.items():
+        file_name = info.get("fileName")
+        capture_date = info.get("captureDate")
+        if not file_name or not capture_date:
+            continue
+        try:
+            dt = capture_date.split("T")[0]  # 'YYYY-MM-DD'
+            yyyy = dt[:4]
+            rel_path = f"{yyyy}/{dt}/{file_name}"
+        except Exception:
+            continue
+        if rel_path in originals:
+            photos[asset_id]["localOriginal"] = rel_path
+            matched_rel_paths.add(rel_path)
+    return matched_rel_paths
+
+def _log_missing_local_originals(photos):
+    missing = 0
+    for asset_id, info in photos.items():
+        if "localOriginal" not in info:
+            log.warning(f"Asset '{asset_id}' (fileName='{info.get('fileName')}') not matched to any local original file.")
+            missing += 1
+    if missing:
+        log.info(f"Total assets missing local original file: {missing}")
+
+def _match_originals_by_sha256(photos, unmatched_files, originals_dir):
+    # Do a linear scan once through photos to build sha256 -> asset_id map for unmatched assets
+    sha_to_asset = {info.get("sha256"): asset_id for asset_id, info in photos.items() if info.get("sha256") and "localOriginal" not in info}
+    log.info(f"Unmatched SHAs: {len(sha_to_asset.keys())}")  
+    for rel_path in unmatched_files:
+        abs_path = os.path.join(originals_dir, rel_path)
+        if not os.path.exists(abs_path):
+            log.warning(f"Original file '{rel_path}' expected at '{abs_path}' does not exist on disk. Skipping SHA check.")
+            continue
+        sha = sha256_of_file(abs_path)
+        asset_id = sha_to_asset.get(sha)
+        if asset_id:
+            photos[asset_id]["localOriginal"] = rel_path
+
+def _find_pick_assets_by_exact_date(photos, date_to_asset_ids, norm_exif_date):
+    asset_ids = date_to_asset_ids.get(norm_exif_date)
+    if not asset_ids:
+        return []
+    return [asset_id for asset_id in asset_ids if photos.get(asset_id, {}).get("flag") == "pick"]
+
+def _find_pick_assets_by_prefix(photos, norm_exif_date):
+    pick_assets = []
+    if not norm_exif_date:
+        return pick_assets
+    for asset_id, info in photos.items():
+        if info.get("flag") == "pick":
+            cap_date = normalize_capture_date(info.get("captureDate"))
+            if isinstance(cap_date, str) and cap_date.startswith(norm_exif_date):
+                pick_assets.append(asset_id)
+    return pick_assets
+
+def _handle_export_match(photos, rel_path, norm_exif_date, pick_assets):
+    if not pick_assets:
+        log.warning(f"Export file '{rel_path}' not matched in JSON (EXIF date '{norm_exif_date}')")
+    elif len(pick_assets) > 1:
+        log.warning(f"Ambiguous match for export file '{rel_path}' with EXIF date '{norm_exif_date}' (multiple pick assets)")
+    else:
+        asset_id = pick_assets[0]
+        photos[asset_id]["localEdit"] = rel_path
+
+def _match_exports_by_exif_date(photos, exports, date_to_asset_ids, exports_dir):
+    for rel_path in exports:
+        abs_path = os.path.join(exports_dir, rel_path)
+        exif_date = get_capture_date_from_exif(abs_path)
+        norm_exif_date = normalize_capture_date(exif_date)
+        pick_assets = _find_pick_assets_by_exact_date(photos, date_to_asset_ids, norm_exif_date)
+        if not pick_assets:
+            pick_assets = _find_pick_assets_by_prefix(photos, norm_exif_date)
+        _handle_export_match(photos, rel_path, norm_exif_date, pick_assets)
+
+# Main
+def main():
+    parser = argparse.ArgumentParser(description="Lightroom backup and local file matcher")
+    parser.add_argument("--use-backup-json", metavar="PATH", help="Path to backup JSON file to use instead of fetching from API")
+    args = parser.parse_args()
+
+    # First we use the Lightroom API as the source of truth for assets and metadata
+    # Since this is slow, we can use a local file from a previous run if we want
+    if args.use_backup_json:
+        log.info(f"Loading backup data from {args.use_backup_json}...")
+        with open(args.use_backup_json, "r", encoding="utf-8") as f:
+            backup_data = json.load(f)
+    else:
+        log.info("Starting Adobe Lightroom metadata backup and local file matching...")
+        headers, catalog_data = get_authenticated_headers_and_catalog()
+        catalog_id = catalog_data["id"]
+        log.info(f"Catalog ID: {catalog_id}")
+        # Fetch all albums from the API
+        albums = fetch_all_albums(catalog_id, headers)
+        # Process all albums including fetching their assets from the API
+        backup_data = process_albums(catalog_id, albums, headers)
+        # Write API-fetched backup data to disk with '_api' suffix
+        api_file = OUTPUT_FILE.replace('.json', '_api.json') if OUTPUT_FILE.endswith('.json') else OUTPUT_FILE + '_api'
+        with open(api_file, "w", encoding="utf-8") as f:
+            json.dump(backup_data, f, indent=2)
+        log.info(f"API backup data saved to {api_file}")
+        
+
+    # This is the main matching logic
+    match_files_to_assets(backup_data["photos"], ORIGINALS_DIR, EXPORTS_DIR)
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(backup_data, f, indent=2)
-
-    print(f"\nBackup complete. Saved to {OUTPUT_FILE}")
+    log.info(f"Backup complete. Saved to {OUTPUT_FILE}")
 
 if __name__ == "__main__":
     main()

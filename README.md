@@ -30,17 +30,17 @@ This tool is an attempt to avoid that kind of lock-in with Lightroom CC should I
 
 ## TODO
 
+- Build a restore tool into DigiKam as a local Lightroom CC mirror
 - Add support for incremental backups
 - Improve performance for large libraries
 - Backup additional metadata
 - (Maybe) Explore “Lightroom-Backup-as-a-Service” hosting option
-- (Maybe) Build a restore tool targeting an open-source DAM as a local Lightroom CC mirror
 
 ## Testing
 
 This script has not been thoroughly tested. It has been run successfully on my Lightroom CC library of ~175k photos (execution time ≈ 2 hours).
 
-All API interactions are read-only ([`GET` requests only](https://github.com/michaelmolino/lightroom-backup/blob/master/src/app.py#L127)), so it _should not_ modify or corrupt your Lightroom data. (The only exception is one [`POST` request](https://github.com/michaelmolino/lightroom-backup/blob/master/src/app.py#L122) as part of the OAuth flow.)
+All API interactions are read-only ([`GET` requests only](https://github.com/michaelmolino/lightroom-backup/blob/master/src/app.py#L205)), so it _should not_ modify or corrupt your Lightroom data. (The only exception is one [`POST` request](https://github.com/michaelmolino/lightroom-backup/blob/master/src/app.py#L200) as part of the OAuth flow.)
 
 That said, it’s provided as-is with no warranty. **Use at your own risk**.
 
@@ -64,16 +64,21 @@ You'll also need to do the following:
   - `REDIRECT URI` should be `https://localhost:8080/callback`
   - `REDIRECT URI PATTERN` should be `https://localhost:8080/*`
   - Then set the following environment variables `LIGHTROOM_CLIENT_ID` and `LIGHTROOM_CLIENT_SECRET`.
+  - (Optional) If you provide the path to your Lightroom originals folder, it will attempt to match the API response with the local path to your file. Matches will happen based on file name and date times, and fallback to sha256 hash if necessary.
+    - Set `LIGHTROOM_ORIGINALS_DIR` to the absolute path of your originals folder.
+  - (Optional) If you provie the path to JPEG exports, it will attempt to match the API response with your exports. This is useful to associate a final edited artifact with the original asset. Matching only happens for "picked" assets and only matches on exact exif date times.
+    - Set `LIGHTROOM_EXPORTS_DIR` to the absolute path of your exports folder.
 - Run
   - Locally: `pipenv install && pipenv run python src/app.py`
   - Docker:
 
 ```bash
-docker build -t lightroom-backup .
 docker run --rm -it \
   -p 8080:8080 \
   -v $(pwd)/certs:/app/certs \
   -v $(pwd)/backups:/app/backups \
+  -v "${LIGHTROOM_ORIGINALS_DIR}":/data/originals:ro \
+  -v "${LIGHTROOM_EXPORTS_DIR}":/data/exports:ro \
   -e LIGHTROOM_CLIENT_ID \
   -e LIGHTROOM_CLIENT_SECRET \
   lightroom-backup
